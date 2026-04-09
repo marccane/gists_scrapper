@@ -123,6 +123,15 @@ def parse_compact_number(text):
         return 0
 
 
+def to_int_or_default(value, default=0):
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def extract_social_count(gist_html, marker):
     # Looks for a social-count link around marker (e.g., "stargazers" or "network/members").
     pattern = rf'href="[^"]*{re.escape(marker)}[^"]*"[^>]*>\s*([^<]+)\s*</a>'
@@ -372,20 +381,26 @@ def main():
                 if cached_social is None and gist_url in cache["gists"]:
                     cached_social = cache["gists"].get(gist_url)
             if cached_social is not None:
-                stars = int(cached_social.get("stars", 0))
-                forks = int(cached_social.get("forks", 0))
-                gist_comments = int(cached_social.get("comments", gist.get("comments", 0)))
+                stars = to_int_or_default(cached_social.get("stars", 0), 0)
+                forks = to_int_or_default(cached_social.get("forks", 0), 0)
+                gist_comments = to_int_or_default(
+                    cached_social.get("comments", gist.get("comments", 0)),
+                    to_int_or_default(gist.get("comments", 0), 0),
+                )
                 gist_cache_hit = True
             else:
                 listed = list_stats_by_gist_id.get(gist_id or "")
                 if listed is None:
                     stars, forks = 0, 0
-                    gist_comments = int(gist.get("comments", 0))
+                    gist_comments = to_int_or_default(gist.get("comments", 0), 0)
                     gist_cache_hit = False
                 else:
-                    stars = int(listed.get("stars", 0))
-                    forks = int(listed.get("forks", 0))
-                    gist_comments = int(listed.get("comments", gist.get("comments", 0)))
+                    stars = to_int_or_default(listed.get("stars", 0), 0)
+                    forks = to_int_or_default(listed.get("forks", 0), 0)
+                    gist_comments = to_int_or_default(
+                        listed.get("comments", gist.get("comments", 0)),
+                        to_int_or_default(gist.get("comments", 0), 0),
+                    )
                     gist_cache_hit = False
 
                 cache_key = gist_id or gist_url
