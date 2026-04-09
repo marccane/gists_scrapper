@@ -1,11 +1,13 @@
 import argparse
 import json
 import os
+import re
 import time
 from datetime import datetime
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 import requests
+from lxml import html
 
 
 # Fill this if you do not want to use the GITHUB_TOKEN env var.
@@ -40,13 +42,19 @@ def parse_args():
         "--max-gists-per-user",
         type=int,
         default=30,
-        help="Limit number of gists processed per user.",
+        help="Limit number of gists fetched per user for star parsing.",
     )
     parser.add_argument(
         "--sleep-ms",
         type=int,
         default=120,
         help="Sleep time between HTTP requests in milliseconds.",
+    )
+    parser.add_argument(
+        "--max-pages-per-user",
+        type=int,
+        default=20,
+        help="Max gist-list pages to fetch per user.",
     )
     parser.add_argument(
         "--cache-file",
@@ -61,15 +69,7 @@ def parse_args():
     parser.add_argument(
         "--refresh-gist-social",
         action="store_true",
-        help="Ignore cached gist metrics and refetch from API.",
-    )
-    parser.add_argument(
-        "--include-starred-status",
-        action="store_true",
-        help=(
-            "Check if each gist is starred by the authenticated user via "
-            "GET /gists/{gist_id}/star (extra API requests)."
-        ),
+        help="Ignore cached gist stars/forks and refetch gist pages.",
     )
     parser.add_argument(
         "--verbose-cache",
@@ -82,11 +82,7 @@ def parse_args():
 def build_session():
     session = requests.Session()
     token = os.getenv("GITHUB_TOKEN", "").strip() or GITHUB_TOKEN.strip()
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "gist-star-scan-script",
-        "X-GitHub-Api-Version": "2026-03-10",
-    }
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "gist-star-scan-script"}
     if token and token != "YOUR_GITHUB_ACCESS_TOKEN":
         headers["Authorization"] = f"Bearer {token}"
     session.headers.update(headers)
@@ -103,79 +99,129 @@ def extract_username(profile_url):
     return path_parts[0]
 
 
-def parse_last_page_from_link_header(link_header):
-    # Example:
-    # <.../forks?page=34>; rel="last", <.../forks?page=2>; rel="next"
-    if not link_header:
-        return None
-    parts = [p.strip() for p in link_header.split(",")]
-    for part in parts:
-        if 'rel="last"' not in part:
-            continue
-        left = part.split(";")[0].strip()
-        if not (left.startswith("<") and left.endswith(">")):
-            continue
-        url = left[1:-1]
-        parsed = urlparse(url)
-        query = parse_qs(parsed.query)
-        page_values = query.get("page", [])
-        if not page_values:
-            continue
-        try:
-            return int(page_values[0])
-        except ValueError:
-            return None
-    return None
+def parse_compact_number(text):
+    # Converts text like:
+    # - "1.2k" -> 1200
+    # - "987" -> 987
+    # - "10 stars" -> 10
+    # - "2 forks" -> 2
+    cleaned = text.strip().lower().replace(",", "")
+    if not cleaned:
+        return 0
+    match = re.search(r"(\d+(?:\.\d+)?)([km]?)", cleaned)
+    if not match:
+        return 0
+    number_text, suffix = match.groups()
+    multiplier = 1
+    if suffix == "k":
+        multiplier = 1000
+    elif suffix == "m":
+        multiplier = 1000000
+    try:
+        return int(float(number_text) * multiplier)
+    except ValueError:
+        return 0
+
+
+def extract_social_count(gist_html, marker):
+    # Looks for a social-count link around marker (e.g., "stargazers" or "network/members").
+    pattern = rf'href="[^"]*{re.escape(marker)}[^"]*"[^>]*>\s*([^<]+)\s*</a>'
+    match = re.search(pattern, gist_html, flags=re.IGNORECASE)
+    if not match:
+        return 0
+    return parse_compact_number(match.group(1))
 
 
 def fetch_user_gists(session, username):
-    gists = []
-    page = 1
-    while True:
-        api_url = f"https://api.github.com/users/{username}/gists"
-        response = session.get(api_url, params={"per_page": 100, "page": page}, timeout=30)
+    api_url = f"https://api.github.com/users/{username}/gists"
+    response = session.get(api_url, params={"per_page": 100}, timeout=30)
+    if response.status_code == 404:
+        return []
+    response.raise_for_status()
+    return response.json()
+
+
+def gist_id_from_url(gist_url):
+    parsed = urlparse(gist_url)
+    path_parts = [p for p in parsed.path.split("/") if p]
+    if len(path_parts) < 2:
+        return None
+    # Gist URLs commonly look like:
+    # /<user>/<gist_id>
+    # /<user>/<gist_id>/stargazers
+    # /<user>/<gist_id>/forks
+    # /<user>/<gist_id>#comments
+    # /<user>/<gist_id>/raw/<revision>/<filename>
+    return path_parts[1]
+
+
+def fetch_user_gist_list_stats(session, username, max_pages, sleep_ms):
+    stats_by_gist_id = {}
+    base_url = f"https://gist.github.com/{username}"
+
+    for page in range(1, max_pages + 1):
+        page_url = f"{base_url}?page={page}"
+        response = session.get(
+            page_url,
+            timeout=30,
+            headers={"Accept": "text/html,application/xhtml+xml"},
+        )
         if response.status_code == 404:
-            return []
+            break
         response.raise_for_status()
-        batch = response.json()
-        if not batch:
+
+        tree = html.fromstring(response.text)
+        snippets = tree.xpath("//div[contains(@class,'gist-snippet')]")
+        if not snippets:
             break
-        gists.extend(batch)
-        if len(batch) < 100:
+
+        found_on_page = 0
+        for snippet in snippets:
+            hrefs = snippet.xpath(".//a[contains(@href,'/stargazers')]/@href")
+            if not hrefs:
+                hrefs = snippet.xpath(".//a[contains(@href,'/network/members')]/@href")
+            if not hrefs:
+                hrefs = snippet.xpath(".//a[contains(@href,'/comments')]/@href")
+            if not hrefs:
+                hrefs = snippet.xpath(".//a[contains(@href,'/raw/')]/@href")
+
+            gist_id = None
+            for href in hrefs:
+                gist_id = gist_id_from_url(f"https://gist.github.com{href}")
+                if gist_id:
+                    break
+            if not gist_id:
+                continue
+
+            stars_nodes = snippet.xpath(".//a[contains(@href,'/stargazers')]")
+            forks_nodes = snippet.xpath(
+                ".//a[contains(@href,'/network/members') or contains(@href,'/forks')]"
+            )
+            comments_nodes = snippet.xpath(".//a[contains(@href,'#comments')]")
+
+            stars_text = (
+                " ".join(stars_nodes[0].text_content().split()) if stars_nodes else ""
+            )
+            forks_text = (
+                " ".join(forks_nodes[0].text_content().split()) if forks_nodes else ""
+            )
+            comments_text = (
+                " ".join(comments_nodes[0].text_content().split()) if comments_nodes else ""
+            )
+
+            stats_by_gist_id[gist_id] = {
+                "stars": parse_compact_number(stars_text),
+                "forks": parse_compact_number(forks_text),
+                "comments": parse_compact_number(comments_text),
+            }
+            found_on_page += 1
+
+        if found_on_page == 0:
             break
-        page += 1
-    return gists
 
+        time.sleep(max(sleep_ms, 0) / 1000.0)
 
-def fetch_gist_forks_count(session, gist_id):
-    # API endpoint: GET /gists/{gist_id}/forks
-    forks_url = f"https://api.github.com/gists/{gist_id}/forks"
-    response = session.get(forks_url, params={"per_page": 1, "page": 1}, timeout=30)
-    if response.status_code == 404:
-        return 0
-    response.raise_for_status()
-    batch = response.json()
-    if not batch:
-        return 0
-
-    last_page = parse_last_page_from_link_header(response.headers.get("Link", ""))
-    if last_page is not None:
-        return last_page
-    # No Link header but one item returned -> at least 1 fork.
-    return len(batch)
-
-
-def fetch_gist_starred_by_viewer(session, gist_id):
-    # API endpoint: GET /gists/{gist_id}/star
-    # 204 = starred by current token user, 404 = not starred or inaccessible.
-    star_url = f"https://api.github.com/gists/{gist_id}/star"
-    response = session.get(star_url, timeout=30)
-    if response.status_code == 204:
-        return True
-    if response.status_code == 404:
-        return False
-    response.raise_for_status()
-    return False
+    return stats_by_gist_id
 
 
 def format_date(iso_date):
@@ -194,17 +240,18 @@ def read_profile_urls(path):
 
 def load_cache(path):
     if not os.path.exists(path):
-        return {"users": {}, "gists": {}}
+        return {"users": {}, "gists": {}, "user_list_stats": {}}
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            return {"users": {}, "gists": {}}
+            return {"users": {}, "gists": {}, "user_list_stats": {}}
         data.setdefault("users", {})
         data.setdefault("gists", {})
+        data.setdefault("user_list_stats", {})
         return data
     except (OSError, json.JSONDecodeError):
-        return {"users": {}, "gists": {}}
+        return {"users": {}, "gists": {}, "user_list_stats": {}}
 
 
 def save_cache(path, cache):
@@ -221,6 +268,18 @@ def get_user_gists_cached(session, username, cache, force_refresh=False):
     gists = fetch_user_gists(session, username)
     cache["users"][username] = gists
     return gists, False
+
+
+def get_user_list_stats_cached(
+    session, username, cache, max_pages, sleep_ms, force_refresh=False
+):
+    if not force_refresh and username in cache["user_list_stats"]:
+        return cache["user_list_stats"][username], True
+    stats_by_gist_id = fetch_user_gist_list_stats(
+        session, username, max_pages=max_pages, sleep_ms=sleep_ms
+    )
+    cache["user_list_stats"][username] = stats_by_gist_id
+    return stats_by_gist_id, False
 
 
 def main():
@@ -278,6 +337,27 @@ def main():
             save_cache(args.cache_file, cache)
             continue
 
+        try:
+            list_stats_by_gist_id, list_stats_cache_hit = get_user_list_stats_cached(
+                session,
+                username,
+                cache,
+                max_pages=args.max_pages_per_user,
+                sleep_ms=args.sleep_ms,
+                force_refresh=args.refresh_gist_social,
+            )
+        except requests.RequestException as exc:
+            print(f"[{username}] Failed to fetch gist list page stats: {exc}")
+            print("---")
+            save_cache(args.cache_file, cache)
+            continue
+
+        if args.verbose_cache:
+            print(
+                f"[{username}] gist list stats cache: "
+                f"{'HIT' if list_stats_cache_hit else 'MISS'}"
+            )
+
         enriched = []
         user_gist_hits = 0
         user_gist_misses = 0
@@ -285,46 +365,35 @@ def main():
             gist_url = gist.get("html_url")
             if not gist_url:
                 continue
-            gist_id = gist.get("id")
-            if not gist_id:
-                continue
+            gist_id = gist.get("id") or gist_id_from_url(gist_url)
             cached_social = None
             if not args.refresh_gist_social:
-                cached_social = cache["gists"].get(gist_id)
-
+                cached_social = cache["gists"].get(gist_id) if gist_id else None
+                if cached_social is None and gist_url in cache["gists"]:
+                    cached_social = cache["gists"].get(gist_url)
             if cached_social is not None:
-                stars = cached_social.get("stars")
+                stars = int(cached_social.get("stars", 0))
                 forks = int(cached_social.get("forks", 0))
                 gist_comments = int(cached_social.get("comments", gist.get("comments", 0)))
-                starred_by_viewer = cached_social.get("starred_by_viewer")
                 gist_cache_hit = True
             else:
-                gist_comments = int(gist.get("comments", 0))
-                stars = None  # Not provided by official REST gist responses.
-                starred_by_viewer = None
-                try:
-                    forks = fetch_gist_forks_count(session, gist_id)
-                except requests.RequestException as exc:
-                    print(f"[{username}] Failed to fetch forks count for gist {gist_id}: {exc}")
-                    forks = 0
+                listed = list_stats_by_gist_id.get(gist_id or "")
+                if listed is None:
+                    stars, forks = 0, 0
+                    gist_comments = int(gist.get("comments", 0))
+                    gist_cache_hit = False
+                else:
+                    stars = int(listed.get("stars", 0))
+                    forks = int(listed.get("forks", 0))
+                    gist_comments = int(listed.get("comments", gist.get("comments", 0)))
+                    gist_cache_hit = False
 
-                if args.include_starred_status:
-                    try:
-                        starred_by_viewer = fetch_gist_starred_by_viewer(session, gist_id)
-                    except requests.RequestException as exc:
-                        print(
-                            f"[{username}] Failed to fetch starred status for gist {gist_id}: {exc}"
-                        )
-                        starred_by_viewer = None
-
-                gist_cache_hit = False
-                cache["gists"][gist_id] = {
+                cache_key = gist_id or gist_url
+                cache["gists"][cache_key] = {
                     "stars": stars,
                     "forks": forks,
                     "comments": gist_comments,
-                    "starred_by_viewer": starred_by_viewer,
                 }
-                time.sleep(max(args.sleep_ms, 0) / 1000.0)
 
             if gist_cache_hit:
                 user_gist_hits += 1
@@ -340,7 +409,6 @@ def main():
                     "stars": stars,
                     "forks": forks,
                     "comments": gist_comments,
-                    "starred_by_viewer": starred_by_viewer,
                     "files": len(gist.get("files", {})),
                     "updated_at": gist.get("updated_at", ""),
                 }
@@ -354,30 +422,19 @@ def main():
 
         top = sorted(
             enriched,
-            key=lambda item: (item["forks"], item["comments"], item["files"]),
+            key=lambda item: (item["stars"], item["forks"], item["comments"]),
             reverse=True,
         )[: args.top_n]
 
-        print(f"[{username}] Top {len(top)} gist(s) by forks/comments")
+        print(f"[{username}] Top {len(top)} gist(s) by stars")
         for idx, gist in enumerate(top, start=1):
             print(f"{idx}. {gist['description']}")
             print(f"   URL: {gist['url']}")
-            stars_display = "n/a (REST API does not expose star count)"
-            if gist["stars"] is not None:
-                stars_display = str(gist["stars"])
-            starred_status = "n/a"
-            if args.include_starred_status:
-                if gist["starred_by_viewer"] is True:
-                    starred_status = "yes"
-                elif gist["starred_by_viewer"] is False:
-                    starred_status = "no"
             print(
-                f"   Stars: {stars_display} | Forks: {gist['forks']} | "
+                f"   Stars: {gist['stars']} | Forks: {gist['forks']} | "
                 f"Comments: {gist['comments']} | Files: {gist['files']} | "
                 f"Updated: {format_date(gist['updated_at'])}"
             )
-            if args.include_starred_status:
-                print(f"   Starred by token user: {starred_status}")
         print(
             f"   Cache summary: user_gists={'HIT' if user_cache_hit else 'MISS'} | "
             f"gist_stats hits={user_gist_hits}, misses={user_gist_misses}"
