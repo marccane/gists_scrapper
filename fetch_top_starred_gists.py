@@ -144,9 +144,15 @@ def fetch_user_gists(session, username):
 def gist_id_from_url(gist_url):
     parsed = urlparse(gist_url)
     path_parts = [p for p in parsed.path.split("/") if p]
-    if not path_parts:
+    if len(path_parts) < 2:
         return None
-    return path_parts[-1]
+    # Gist URLs commonly look like:
+    # /<user>/<gist_id>
+    # /<user>/<gist_id>/stargazers
+    # /<user>/<gist_id>/forks
+    # /<user>/<gist_id>#comments
+    # /<user>/<gist_id>/raw/<revision>/<filename>
+    return path_parts[1]
 
 
 def fetch_user_gist_list_stats(session, username, max_pages, sleep_ms):
@@ -155,7 +161,11 @@ def fetch_user_gist_list_stats(session, username, max_pages, sleep_ms):
 
     for page in range(1, max_pages + 1):
         page_url = f"{base_url}?page={page}"
-        response = session.get(page_url, timeout=30)
+        response = session.get(
+            page_url,
+            timeout=30,
+            headers={"Accept": "text/html,application/xhtml+xml"},
+        )
         if response.status_code == 404:
             break
         response.raise_for_status()
@@ -183,15 +193,21 @@ def fetch_user_gist_list_stats(session, username, max_pages, sleep_ms):
             if not gist_id:
                 continue
 
-            stars_text = "".join(
-                snippet.xpath(".//a[contains(@href,'/stargazers')]/text()")
-            ).strip()
-            forks_text = "".join(
-                snippet.xpath(".//a[contains(@href,'/network/members')]/text()")
-            ).strip()
-            comments_text = "".join(
-                snippet.xpath(".//a[contains(@href,'/comments')]/text()")
-            ).strip()
+            stars_nodes = snippet.xpath(".//a[contains(@href,'/stargazers')]")
+            forks_nodes = snippet.xpath(
+                ".//a[contains(@href,'/network/members') or contains(@href,'/forks')]"
+            )
+            comments_nodes = snippet.xpath(".//a[contains(@href,'#comments')]")
+
+            stars_text = (
+                " ".join(stars_nodes[0].text_content().split()) if stars_nodes else ""
+            )
+            forks_text = (
+                " ".join(forks_nodes[0].text_content().split()) if forks_nodes else ""
+            )
+            comments_text = (
+                " ".join(comments_nodes[0].text_content().split()) if comments_nodes else ""
+            )
 
             stats_by_gist_id[gist_id] = {
                 "stars": parse_compact_number(stars_text),
