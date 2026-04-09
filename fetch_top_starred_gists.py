@@ -64,6 +64,11 @@ def parse_args():
         action="store_true",
         help="Ignore cached gist stars/forks and refetch gist pages.",
     )
+    parser.add_argument(
+        "--verbose-cache",
+        action="store_true",
+        help="Print cache hit/miss information.",
+    )
     return parser.parse_args()
 
 
@@ -171,19 +176,19 @@ def save_cache(path, cache):
 
 def get_user_gists_cached(session, username, cache, force_refresh=False):
     if not force_refresh and username in cache["users"]:
-        return cache["users"][username]
+        return cache["users"][username], True
     gists = fetch_user_gists(session, username)
     cache["users"][username] = gists
-    return gists
+    return gists, False
 
 
 def get_gist_social_counts_cached(session, gist_url, cache, force_refresh=False):
     if not force_refresh and gist_url in cache["gists"]:
         cached = cache["gists"][gist_url]
-        return int(cached.get("stars", 0)), int(cached.get("forks", 0))
+        return int(cached.get("stars", 0)), int(cached.get("forks", 0)), True
     stars, forks = fetch_gist_social_counts(session, gist_url)
     cache["gists"][gist_url] = {"stars": int(stars), "forks": int(forks)}
-    return stars, forks
+    return stars, forks, False
 
 
 def main():
@@ -200,6 +205,12 @@ def main():
         return
 
     print(f"Processing {len(profile_urls)} user(s) from {args.input_file}\n")
+    print(f"Using cache file: {args.cache_file}\n")
+
+    total_user_cache_hits = 0
+    total_user_cache_misses = 0
+    total_gist_cache_hits = 0
+    total_gist_cache_misses = 0
 
     for profile_url in profile_urls:
         username = extract_username(profile_url)
@@ -208,36 +219,70 @@ def main():
             continue
 
         try:
-            gists = get_user_gists_cached(
+            gists, user_cache_hit = get_user_gists_cached(
                 session,
                 username,
                 cache,
                 force_refresh=args.refresh_user_gists,
             )
+            if user_cache_hit:
+                total_user_cache_hits += 1
+            else:
+                total_user_cache_misses += 1
+            if args.verbose_cache:
+                print(
+                    f"[{username}] user gists cache: "
+                    f"{'HIT' if user_cache_hit else 'MISS'}"
+                )
         except requests.RequestException as exc:
             print(f"[{username}] Failed to fetch gist list: {exc}")
             print("---")
+            save_cache(args.cache_file, cache)
             continue
 
         if not gists:
-            print(f"[{username}] No gists found.")
+            print(f"[{username}] No gists found. (user cache: {'HIT' if user_cache_hit else 'MISS'})")
             print("---")
+            save_cache(args.cache_file, cache)
             continue
 
         enriched = []
+        user_gist_hits = 0
+        user_gist_misses = 0
         for gist in gists[: args.max_gists_per_user]:
             gist_url = gist.get("html_url")
             if not gist_url:
                 continue
             try:
-                stars, forks = get_gist_social_counts_cached(
+                stars, forks, gist_cache_hit = get_gist_social_counts_cached(
                     session,
                     gist_url,
                     cache,
                     force_refresh=args.refresh_gist_social,
                 )
-            except requests.RequestException:
+                if args.verbose_cache:
+                    print(
+                        f"[{username}] gist stats cache: "
+                        f"{'HIT' if gist_cache_hit else 'MISS'} | {gist_url}"
+                    )
+            except requests.RequestException as exc:
                 stars, forks = 0, 0
+                gist_cache_hit = False
+                print(f"[{username}] Failed to fetch gist stats for {gist_url}: {exc}")
+                # Cache fallback values on request failures to avoid
+                # repeatedly retrying the same gist URL on subsequent runs.
+                cache["gists"][gist_url] = {
+                    "stars": 0,
+                    "forks": 0,
+                    "fetch_error": True,
+                }
+
+            if gist_cache_hit:
+                user_gist_hits += 1
+                total_gist_cache_hits += 1
+            else:
+                user_gist_misses += 1
+                total_gist_cache_misses += 1
 
             enriched.append(
                 {
@@ -250,11 +295,13 @@ def main():
                     "updated_at": gist.get("updated_at", ""),
                 }
             )
-            time.sleep(max(args.sleep_ms, 0) / 1000.0)
+            if not gist_cache_hit:
+                time.sleep(max(args.sleep_ms, 0) / 1000.0)
 
         if not enriched:
             print(f"[{username}] Could not fetch any gist stats.")
             print("---")
+            save_cache(args.cache_file, cache)
             continue
 
         top = sorted(
@@ -272,9 +319,20 @@ def main():
                 f"Comments: {gist['comments']} | Files: {gist['files']} | "
                 f"Updated: {format_date(gist['updated_at'])}"
             )
+        print(
+            f"   Cache summary: user_gists={'HIT' if user_cache_hit else 'MISS'} | "
+            f"gist_stats hits={user_gist_hits}, misses={user_gist_misses}"
+        )
         print("---")
+        # Save incrementally so interrupted runs still keep progress.
+        save_cache(args.cache_file, cache)
 
     save_cache(args.cache_file, cache)
+    print(
+        "\nOverall cache summary: "
+        f"user_gists hits={total_user_cache_hits}, misses={total_user_cache_misses} | "
+        f"gist_stats hits={total_gist_cache_hits}, misses={total_gist_cache_misses}"
+    )
 
 
 if __name__ == "__main__":
