@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import re
 import time
@@ -47,6 +48,21 @@ def parse_args():
         type=int,
         default=120,
         help="Sleep time between gist-page requests in milliseconds.",
+    )
+    parser.add_argument(
+        "--cache-file",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "gists_cache.json"),
+        help="Path to local cache JSON file.",
+    )
+    parser.add_argument(
+        "--refresh-user-gists",
+        action="store_true",
+        help="Ignore cached user gist lists and refetch from API.",
+    )
+    parser.add_argument(
+        "--refresh-gist-social",
+        action="store_true",
+        help="Ignore cached gist stars/forks and refetch gist pages.",
     )
     return parser.parse_args()
 
@@ -130,9 +146,50 @@ def read_profile_urls(path):
         return [line.strip() for line in f if line.strip()]
 
 
+def load_cache(path):
+    if not os.path.exists(path):
+        return {"users": {}, "gists": {}}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"users": {}, "gists": {}}
+        data.setdefault("users", {})
+        data.setdefault("gists", {})
+        return data
+    except (OSError, json.JSONDecodeError):
+        return {"users": {}, "gists": {}}
+
+
+def save_cache(path, cache):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=True, indent=2, sort_keys=True)
+    except OSError as exc:
+        print(f"Warning: failed to write cache file {path}: {exc}")
+
+
+def get_user_gists_cached(session, username, cache, force_refresh=False):
+    if not force_refresh and username in cache["users"]:
+        return cache["users"][username]
+    gists = fetch_user_gists(session, username)
+    cache["users"][username] = gists
+    return gists
+
+
+def get_gist_social_counts_cached(session, gist_url, cache, force_refresh=False):
+    if not force_refresh and gist_url in cache["gists"]:
+        cached = cache["gists"][gist_url]
+        return int(cached.get("stars", 0)), int(cached.get("forks", 0))
+    stars, forks = fetch_gist_social_counts(session, gist_url)
+    cache["gists"][gist_url] = {"stars": int(stars), "forks": int(forks)}
+    return stars, forks
+
+
 def main():
     args = parse_args()
     session = build_session()
+    cache = load_cache(args.cache_file)
     profile_urls = read_profile_urls(args.input_file)
 
     if args.max_users > 0:
@@ -151,7 +208,12 @@ def main():
             continue
 
         try:
-            gists = fetch_user_gists(session, username)
+            gists = get_user_gists_cached(
+                session,
+                username,
+                cache,
+                force_refresh=args.refresh_user_gists,
+            )
         except requests.RequestException as exc:
             print(f"[{username}] Failed to fetch gist list: {exc}")
             print("---")
@@ -168,7 +230,12 @@ def main():
             if not gist_url:
                 continue
             try:
-                stars, forks = fetch_gist_social_counts(session, gist_url)
+                stars, forks = get_gist_social_counts_cached(
+                    session,
+                    gist_url,
+                    cache,
+                    force_refresh=args.refresh_gist_social,
+                )
             except requests.RequestException:
                 stars, forks = 0, 0
 
@@ -206,6 +273,8 @@ def main():
                 f"Updated: {format_date(gist['updated_at'])}"
             )
         print("---")
+
+    save_cache(args.cache_file, cache)
 
 
 if __name__ == "__main__":
