@@ -100,19 +100,25 @@ def extract_username(profile_url):
 
 
 def parse_compact_number(text):
-    # Converts "1.2k" to 1200 and "987" to 987.
+    # Converts text like:
+    # - "1.2k" -> 1200
+    # - "987" -> 987
+    # - "10 stars" -> 10
+    # - "2 forks" -> 2
     cleaned = text.strip().lower().replace(",", "")
     if not cleaned:
         return 0
+    match = re.search(r"(\d+(?:\.\d+)?)([km]?)", cleaned)
+    if not match:
+        return 0
+    number_text, suffix = match.groups()
     multiplier = 1
-    if cleaned.endswith("k"):
+    if suffix == "k":
         multiplier = 1000
-        cleaned = cleaned[:-1]
-    elif cleaned.endswith("m"):
+    elif suffix == "m":
         multiplier = 1000000
-        cleaned = cleaned[:-1]
     try:
-        return int(float(cleaned) * multiplier)
+        return int(float(number_text) * multiplier)
     except ValueError:
         return 0
 
