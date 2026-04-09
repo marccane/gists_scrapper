@@ -350,9 +350,11 @@ def main():
             if not gist_url:
                 continue
             gist_id = gist.get("id") or gist_id_from_url(gist_url)
-            cached_social = cache["gists"].get(gist_id) if gist_id else None
-            if cached_social is None and gist_url in cache["gists"]:
-                cached_social = cache["gists"].get(gist_url)
+            cached_social = None
+            if not args.refresh_gist_social:
+                cached_social = cache["gists"].get(gist_id) if gist_id else None
+                if cached_social is None and gist_url in cache["gists"]:
+                    cached_social = cache["gists"].get(gist_url)
             if cached_social is not None:
                 stars = int(cached_social.get("stars", 0))
                 forks = int(cached_social.get("forks", 0))
