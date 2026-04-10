@@ -279,6 +279,30 @@ def get_user_gists_cached(session, username, cache, force_refresh=False):
     return gists, False
 
 
+def get_cached_gist_social(cache, gist_id, gist_url, refresh_gist_social):
+    if refresh_gist_social:
+        return None
+    if gist_id and cache["gists"].get(gist_id) is not None:
+        return cache["gists"][gist_id]
+    if gist_url in cache["gists"]:
+        return cache["gists"][gist_url]
+    return None
+
+
+def all_slice_gists_social_cached(cache, gists_slice, refresh_gist_social):
+    if refresh_gist_social:
+        return False
+    with_url = [g for g in gists_slice if g.get("html_url")]
+    if not with_url:
+        return False
+    for gist in with_url:
+        gist_url = gist["html_url"]
+        gid = gist.get("id") or gist_id_from_url(gist_url)
+        if get_cached_gist_social(cache, gid, gist_url, False) is None:
+            return False
+    return True
+
+
 def get_user_list_stats_cached(
     session, username, cache, max_pages, sleep_ms, force_refresh=False
 ):
@@ -312,6 +336,8 @@ def main():
     total_gist_cache_hits = 0
     total_gist_cache_misses = 0
 
+    cache_dirty = False
+
     interrupted = False
     try:
         for profile_url in profile_urls:
@@ -331,6 +357,7 @@ def main():
                     total_user_cache_hits += 1
                 else:
                     total_user_cache_misses += 1
+                    cache_dirty = True
                 if args.verbose_cache:
                     print(
                         f"[{username}] user gists cache: "
@@ -339,28 +366,43 @@ def main():
             except requests.RequestException as exc:
                 print(f"[{username}] Failed to fetch gist list: {exc}")
                 print("---")
-                save_cache(args.cache_file, cache)
+                if cache_dirty:
+                    save_cache(args.cache_file, cache)
+                    cache_dirty = False
                 continue
 
             if not gists:
                 print(f"[{username}] No gists found. (user cache: {'HIT' if user_cache_hit else 'MISS'})")
                 print("---")
-                save_cache(args.cache_file, cache)
+                if cache_dirty:
+                    save_cache(args.cache_file, cache)
+                    cache_dirty = False
                 continue
 
+            gists_slice = gists[: args.max_gists_per_user]
             try:
-                list_stats_by_gist_id, list_stats_cache_hit = get_user_list_stats_cached(
-                    session,
-                    username,
-                    cache,
-                    max_pages=args.max_pages_per_user,
-                    sleep_ms=args.sleep_ms,
-                    force_refresh=args.refresh_gist_social,
-                )
+                if all_slice_gists_social_cached(
+                    cache, gists_slice, args.refresh_gist_social
+                ):
+                    list_stats_by_gist_id = {}
+                    list_stats_cache_hit = True
+                else:
+                    list_stats_by_gist_id, list_stats_cache_hit = get_user_list_stats_cached(
+                        session,
+                        username,
+                        cache,
+                        max_pages=args.max_pages_per_user,
+                        sleep_ms=args.sleep_ms,
+                        force_refresh=args.refresh_gist_social,
+                    )
+                    if not list_stats_cache_hit:
+                        cache_dirty = True
             except requests.RequestException as exc:
                 print(f"[{username}] Failed to fetch gist list page stats: {exc}")
                 print("---")
-                save_cache(args.cache_file, cache)
+                if cache_dirty:
+                    save_cache(args.cache_file, cache)
+                    cache_dirty = False
                 continue
 
             if args.verbose_cache:
@@ -372,16 +414,14 @@ def main():
             enriched = []
             user_gist_hits = 0
             user_gist_misses = 0
-            for gist in gists[: args.max_gists_per_user]:
+            for gist in gists_slice:
                 gist_url = gist.get("html_url")
                 if not gist_url:
                     continue
                 gist_id = gist.get("id") or gist_id_from_url(gist_url)
-                cached_social = None
-                if not args.refresh_gist_social:
-                    cached_social = cache["gists"].get(gist_id) if gist_id else None
-                    if cached_social is None and gist_url in cache["gists"]:
-                        cached_social = cache["gists"].get(gist_url)
+                cached_social = get_cached_gist_social(
+                    cache, gist_id, gist_url, args.refresh_gist_social
+                )
                 if cached_social is not None:
                     stars = to_int_or_default(cached_social.get("stars", 0), 0)
                     forks = to_int_or_default(cached_social.get("forks", 0), 0)
@@ -411,6 +451,7 @@ def main():
                         "forks": forks,
                         "comments": gist_comments,
                     }
+                    cache_dirty = True
 
                 if gist_cache_hit:
                     user_gist_hits += 1
@@ -434,7 +475,9 @@ def main():
             if not enriched:
                 print(f"[{username}] Could not fetch any gist stats.")
                 print("---")
-                save_cache(args.cache_file, cache)
+                if cache_dirty:
+                    save_cache(args.cache_file, cache)
+                    cache_dirty = False
                 continue
 
             top = sorted(
@@ -457,13 +500,16 @@ def main():
                 f"gist_stats hits={user_gist_hits}, misses={user_gist_misses}"
             )
             print("---")
-            # Save incrementally so interrupted runs still keep progress.
-            save_cache(args.cache_file, cache)
+            # Save incrementally when the cache changed so interrupted runs keep progress.
+            if cache_dirty:
+                save_cache(args.cache_file, cache)
+                cache_dirty = False
     except KeyboardInterrupt:
         interrupted = True
         print("\nInterrupted by user (Ctrl+C). Saving cache before exit...")
     finally:
-        save_cache(args.cache_file, cache)
+        if cache_dirty:
+            save_cache(args.cache_file, cache)
         if interrupted:
             print("Cache saved.")
         else:
