@@ -312,158 +312,166 @@ def main():
     total_gist_cache_hits = 0
     total_gist_cache_misses = 0
 
-    for profile_url in profile_urls:
-        username = extract_username(profile_url)
-        if not username:
-            print(f"Skipping invalid GitHub profile URL: {profile_url}")
-            continue
+    interrupted = False
+    try:
+        for profile_url in profile_urls:
+            username = extract_username(profile_url)
+            if not username:
+                print(f"Skipping invalid GitHub profile URL: {profile_url}")
+                continue
 
-        try:
-            gists, user_cache_hit = get_user_gists_cached(
-                session,
-                username,
-                cache,
-                force_refresh=args.refresh_user_gists,
-            )
-            if user_cache_hit:
-                total_user_cache_hits += 1
-            else:
-                total_user_cache_misses += 1
+            try:
+                gists, user_cache_hit = get_user_gists_cached(
+                    session,
+                    username,
+                    cache,
+                    force_refresh=args.refresh_user_gists,
+                )
+                if user_cache_hit:
+                    total_user_cache_hits += 1
+                else:
+                    total_user_cache_misses += 1
+                if args.verbose_cache:
+                    print(
+                        f"[{username}] user gists cache: "
+                        f"{'HIT' if user_cache_hit else 'MISS'}"
+                    )
+            except requests.RequestException as exc:
+                print(f"[{username}] Failed to fetch gist list: {exc}")
+                print("---")
+                save_cache(args.cache_file, cache)
+                continue
+
+            if not gists:
+                print(f"[{username}] No gists found. (user cache: {'HIT' if user_cache_hit else 'MISS'})")
+                print("---")
+                save_cache(args.cache_file, cache)
+                continue
+
+            try:
+                list_stats_by_gist_id, list_stats_cache_hit = get_user_list_stats_cached(
+                    session,
+                    username,
+                    cache,
+                    max_pages=args.max_pages_per_user,
+                    sleep_ms=args.sleep_ms,
+                    force_refresh=args.refresh_gist_social,
+                )
+            except requests.RequestException as exc:
+                print(f"[{username}] Failed to fetch gist list page stats: {exc}")
+                print("---")
+                save_cache(args.cache_file, cache)
+                continue
+
             if args.verbose_cache:
                 print(
-                    f"[{username}] user gists cache: "
-                    f"{'HIT' if user_cache_hit else 'MISS'}"
+                    f"[{username}] gist list stats cache: "
+                    f"{'HIT' if list_stats_cache_hit else 'MISS'}"
                 )
-        except requests.RequestException as exc:
-            print(f"[{username}] Failed to fetch gist list: {exc}")
-            print("---")
-            save_cache(args.cache_file, cache)
-            continue
 
-        if not gists:
-            print(f"[{username}] No gists found. (user cache: {'HIT' if user_cache_hit else 'MISS'})")
-            print("---")
-            save_cache(args.cache_file, cache)
-            continue
-
-        try:
-            list_stats_by_gist_id, list_stats_cache_hit = get_user_list_stats_cached(
-                session,
-                username,
-                cache,
-                max_pages=args.max_pages_per_user,
-                sleep_ms=args.sleep_ms,
-                force_refresh=args.refresh_gist_social,
-            )
-        except requests.RequestException as exc:
-            print(f"[{username}] Failed to fetch gist list page stats: {exc}")
-            print("---")
-            save_cache(args.cache_file, cache)
-            continue
-
-        if args.verbose_cache:
-            print(
-                f"[{username}] gist list stats cache: "
-                f"{'HIT' if list_stats_cache_hit else 'MISS'}"
-            )
-
-        enriched = []
-        user_gist_hits = 0
-        user_gist_misses = 0
-        for gist in gists[: args.max_gists_per_user]:
-            gist_url = gist.get("html_url")
-            if not gist_url:
-                continue
-            gist_id = gist.get("id") or gist_id_from_url(gist_url)
-            cached_social = None
-            if not args.refresh_gist_social:
-                cached_social = cache["gists"].get(gist_id) if gist_id else None
-                if cached_social is None and gist_url in cache["gists"]:
-                    cached_social = cache["gists"].get(gist_url)
-            if cached_social is not None:
-                stars = to_int_or_default(cached_social.get("stars", 0), 0)
-                forks = to_int_or_default(cached_social.get("forks", 0), 0)
-                gist_comments = to_int_or_default(
-                    cached_social.get("comments", gist.get("comments", 0)),
-                    to_int_or_default(gist.get("comments", 0), 0),
-                )
-                gist_cache_hit = True
-            else:
-                listed = list_stats_by_gist_id.get(gist_id or "")
-                if listed is None:
-                    stars, forks = 0, 0
-                    gist_comments = to_int_or_default(gist.get("comments", 0), 0)
-                    gist_cache_hit = False
-                else:
-                    stars = to_int_or_default(listed.get("stars", 0), 0)
-                    forks = to_int_or_default(listed.get("forks", 0), 0)
+            enriched = []
+            user_gist_hits = 0
+            user_gist_misses = 0
+            for gist in gists[: args.max_gists_per_user]:
+                gist_url = gist.get("html_url")
+                if not gist_url:
+                    continue
+                gist_id = gist.get("id") or gist_id_from_url(gist_url)
+                cached_social = None
+                if not args.refresh_gist_social:
+                    cached_social = cache["gists"].get(gist_id) if gist_id else None
+                    if cached_social is None and gist_url in cache["gists"]:
+                        cached_social = cache["gists"].get(gist_url)
+                if cached_social is not None:
+                    stars = to_int_or_default(cached_social.get("stars", 0), 0)
+                    forks = to_int_or_default(cached_social.get("forks", 0), 0)
                     gist_comments = to_int_or_default(
-                        listed.get("comments", gist.get("comments", 0)),
+                        cached_social.get("comments", gist.get("comments", 0)),
                         to_int_or_default(gist.get("comments", 0), 0),
                     )
-                    gist_cache_hit = False
+                    gist_cache_hit = True
+                else:
+                    listed = list_stats_by_gist_id.get(gist_id or "")
+                    if listed is None:
+                        stars, forks = 0, 0
+                        gist_comments = to_int_or_default(gist.get("comments", 0), 0)
+                        gist_cache_hit = False
+                    else:
+                        stars = to_int_or_default(listed.get("stars", 0), 0)
+                        forks = to_int_or_default(listed.get("forks", 0), 0)
+                        gist_comments = to_int_or_default(
+                            listed.get("comments", gist.get("comments", 0)),
+                            to_int_or_default(gist.get("comments", 0), 0),
+                        )
+                        gist_cache_hit = False
 
-                cache_key = gist_id or gist_url
-                cache["gists"][cache_key] = {
-                    "stars": stars,
-                    "forks": forks,
-                    "comments": gist_comments,
-                }
+                    cache_key = gist_id or gist_url
+                    cache["gists"][cache_key] = {
+                        "stars": stars,
+                        "forks": forks,
+                        "comments": gist_comments,
+                    }
 
-            if gist_cache_hit:
-                user_gist_hits += 1
-                total_gist_cache_hits += 1
-            else:
-                user_gist_misses += 1
-                total_gist_cache_misses += 1
+                if gist_cache_hit:
+                    user_gist_hits += 1
+                    total_gist_cache_hits += 1
+                else:
+                    user_gist_misses += 1
+                    total_gist_cache_misses += 1
 
-            enriched.append(
-                {
-                    "description": gist.get("description") or "No description",
-                    "url": gist_url,
-                    "stars": stars,
-                    "forks": forks,
-                    "comments": gist_comments,
-                    "files": len(gist.get("files", {})),
-                    "updated_at": gist.get("updated_at", ""),
-                }
-            )
+                enriched.append(
+                    {
+                        "description": gist.get("description") or "No description",
+                        "url": gist_url,
+                        "stars": stars,
+                        "forks": forks,
+                        "comments": gist_comments,
+                        "files": len(gist.get("files", {})),
+                        "updated_at": gist.get("updated_at", ""),
+                    }
+                )
 
-        if not enriched:
-            print(f"[{username}] Could not fetch any gist stats.")
-            print("---")
-            save_cache(args.cache_file, cache)
-            continue
+            if not enriched:
+                print(f"[{username}] Could not fetch any gist stats.")
+                print("---")
+                save_cache(args.cache_file, cache)
+                continue
 
-        top = sorted(
-            enriched,
-            key=lambda item: (item["stars"], item["forks"], item["comments"]),
-            reverse=True,
-        )[: args.top_n]
+            top = sorted(
+                enriched,
+                key=lambda item: (item["stars"], item["forks"], item["comments"]),
+                reverse=True,
+            )[: args.top_n]
 
-        print(f"[{username}] Top {len(top)} gist(s) by stars")
-        for idx, gist in enumerate(top, start=1):
-            print(f"{idx}. {gist['description']}")
-            print(f"   URL: {gist['url']}")
+            print(f"[{username}] Top {len(top)} gist(s) by stars")
+            for idx, gist in enumerate(top, start=1):
+                print(f"{idx}. {gist['description']}")
+                print(f"   URL: {gist['url']}")
+                print(
+                    f"   Stars: {gist['stars']} | Forks: {gist['forks']} | "
+                    f"Comments: {gist['comments']} | Files: {gist['files']} | "
+                    f"Updated: {format_date(gist['updated_at'])}"
+                )
             print(
-                f"   Stars: {gist['stars']} | Forks: {gist['forks']} | "
-                f"Comments: {gist['comments']} | Files: {gist['files']} | "
-                f"Updated: {format_date(gist['updated_at'])}"
+                f"   Cache summary: user_gists={'HIT' if user_cache_hit else 'MISS'} | "
+                f"gist_stats hits={user_gist_hits}, misses={user_gist_misses}"
             )
-        print(
-            f"   Cache summary: user_gists={'HIT' if user_cache_hit else 'MISS'} | "
-            f"gist_stats hits={user_gist_hits}, misses={user_gist_misses}"
-        )
-        print("---")
-        # Save incrementally so interrupted runs still keep progress.
+            print("---")
+            # Save incrementally so interrupted runs still keep progress.
+            save_cache(args.cache_file, cache)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nInterrupted by user (Ctrl+C). Saving cache before exit...")
+    finally:
         save_cache(args.cache_file, cache)
-
-    save_cache(args.cache_file, cache)
-    print(
-        "\nOverall cache summary: "
-        f"user_gists hits={total_user_cache_hits}, misses={total_user_cache_misses} | "
-        f"gist_stats hits={total_gist_cache_hits}, misses={total_gist_cache_misses}"
-    )
+        if interrupted:
+            print("Cache saved.")
+        else:
+            print(
+                "\nOverall cache summary: "
+                f"user_gists hits={total_user_cache_hits}, misses={total_user_cache_misses} | "
+                f"gist_stats hits={total_gist_cache_hits}, misses={total_gist_cache_misses}"
+            )
 
 
 if __name__ == "__main__":
