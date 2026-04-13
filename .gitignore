@@ -2,3 +2,4 @@ github_following_users*
 __pycache__
 *txt
 *json
+*json.gz
